@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Bot, SendHorizonal, ChevronDown, ChevronUp, FileText, HelpCircle, Search, Type } from 'lucide-react';
+import { Bot, SendHorizonal, ChevronDown, ChevronUp, FileText, HelpCircle, Search, Type, Globe } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
 function TypingIndicator() {
@@ -95,6 +95,17 @@ function MessageBubble({ message }) {
         }}>
           <HelpCircle style={{ width: 12, height: 12 }} />
           Clarifying question
+        </div>
+      )}
+      {/* Web enhanced indicator */}
+      {!isUser && message.type === 'answer_with_search' && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          marginLeft: 44, marginBottom: 4,
+          fontSize: 11, color: '#059669', fontWeight: 500,
+        }}>
+          <Globe style={{ width: 12, height: 12 }} />
+          Enhanced with web search
         </div>
       )}
       <div style={{

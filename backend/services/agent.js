@@ -4,14 +4,17 @@
  * State graph:
  *   START → analyzeQuery
  *     ├── (needs clarification) → askClarification → END
- *     └── (ready) → retrieve (vector + keyword parallel) → fuseResults → generateResponse → END
+ *     └── (ready) → retrieve (vector + keyword parallel) → fuseResults → routeAfterFusion
+ *                        ├── (needs external knowledge) → webSearch → generateResponse → END
+ *                        └── (sufficient context)       → generateResponse → END
  *
  * Features:
  *   - Intent classification with conversation-aware analysis
  *   - Hybrid retrieval: semantic vector search + BM25 keyword search
  *   - Reciprocal Rank Fusion (RRF) for result merging
  *   - Clarifying question generation for ambiguous queries
- *   - Grounded response generation with source citations
+ *   - Web search via Gemini Google Search grounding for external knowledge
+ *   - LLM-smart response generation: combines document context + external knowledge
  *   - Structured logging with trace IDs
  *   - Graceful degradation on partial failures
  */
@@ -36,12 +39,17 @@ const AgentState = Annotation.Root({
   // Query analysis
   intent:             Annotation({ reducer: (_, v) => v ?? _, default: () => 'question' }),
   needsClarification: Annotation({ reducer: (_, v) => v !== undefined ? v : _, default: () => false }),
+  needsExternalSearch:Annotation({ reducer: (_, v) => v !== undefined ? v : _, default: () => false }),
   clarifyReason:      Annotation({ reducer: (_, v) => v ?? _, default: () => '' }),
 
   // Retrieval results
   vectorResults:      Annotation({ reducer: (_, v) => v ?? _, default: () => [] }),
   keywordResults:     Annotation({ reducer: (_, v) => v ?? _, default: () => [] }),
   fusedResults:       Annotation({ reducer: (_, v) => v ?? _, default: () => [] }),
+
+  // Web search
+  webSearchContext:   Annotation({ reducer: (_, v) => v ?? _, default: () => '' }),
+  webSearchUsed:      Annotation({ reducer: (_, v) => v !== undefined ? v : _, default: () => false }),
 
   // Output
   response:           Annotation({ reducer: (_, v) => v ?? _, default: () => '' }),
@@ -55,7 +63,9 @@ async function analyzeQuery(state) {
   const { query, history, traceId } = state;
   log.info('Analyzing query intent', { traceId, queryPreview: query.slice(0, 80) });
 
-  const analysisPrompt = `You are a query analyzer for a document Q&A system. Analyze the user's question and determine if it is clear enough to search for information, or if clarification is needed.
+  const analysisPrompt = `You are a query analyzer for a document Q&A system. Analyze the user's question and determine:
+1. If it is clear enough to search, or needs clarification.
+2. If answering requires external knowledge beyond what a document would contain.
 
 Consider the conversation history — a follow-up like "tell me more" is clear if history provides context.
 
@@ -63,19 +73,24 @@ Respond with ONLY valid JSON (no markdown fences):
 {
   "intent": "question" | "greeting" | "follow_up",
   "needsClarification": true | false,
+  "needsExternalSearch": true | false,
   "clarifyReason": "explanation of what is unclear (empty string if clear)"
 }
 
-ONLY set needsClarification=true when:
-- Query is extremely vague with NO history context (e.g., "tell me stuff")
-- Query references something truly ambiguous that cannot be resolved from history
-- Query asks about multiple completely unrelated topics simultaneously
+needsClarification=true ONLY when:
+- Query is extremely vague with NO history context
+- Query references something truly ambiguous that cannot be resolved
 
-Set needsClarification=false when:
-- Query is specific enough to search (e.g., "what is the revenue?")
-- Query is a follow-up that history makes clear
-- Query asks for a summary or overview
-- Query is a greeting or acknowledgment`;
+needsExternalSearch=true when the query requires knowledge NOT typically found in the document itself, such as:
+- Identifying medical conditions from medicine/drug names in a prescription
+- Explaining what specific medicines are used for or their side effects
+- Looking up technical terms, abbreviations, or codes mentioned in documents
+- Connecting document data to real-world context (e.g., company background, regulatory info)
+- Any question where the document provides raw data but the user needs interpretation using external knowledge
+
+needsExternalSearch=false when:
+- The answer can be fully derived from the document text (summaries, specific facts, quotes)
+- Simple factual lookups from the document content`;
 
   const historyContext = history.length > 0
     ? `\nRecent conversation:\n${history.slice(-6).map(m => `${m.role}: ${m.content.slice(0, 200)}`).join('\n')}`
@@ -83,7 +98,7 @@ Set needsClarification=false when:
 
   try {
     const result = await chatCompletion(analysisPrompt, [], `${historyContext}\n\nUser query: "${query}"`);
-    const jsonMatch = result.match(/\{[\s\S]*\}/);
+    const jsonMatch = result.text.match(/\{[\s\S]*\}/);
 
     if (jsonMatch) {
       const analysis = JSON.parse(jsonMatch[0]);
@@ -91,10 +106,12 @@ Set needsClarification=false when:
         traceId,
         intent: analysis.intent,
         needsClarification: analysis.needsClarification,
+        needsExternalSearch: analysis.needsExternalSearch,
       });
       return {
         intent: analysis.intent || 'question',
         needsClarification: analysis.needsClarification === true,
+        needsExternalSearch: analysis.needsExternalSearch === true,
         clarifyReason: analysis.clarifyReason || '',
       };
     }
@@ -102,8 +119,7 @@ Set needsClarification=false when:
     log.warn('Query analysis failed, defaulting to retrieval', { traceId, error: err.message });
   }
 
-  // Default: assume query is clear and proceed
-  return { intent: 'question', needsClarification: false, clarifyReason: '' };
+  return { intent: 'question', needsClarification: false, needsExternalSearch: false, clarifyReason: '' };
 }
 
 // ─── Node: Ask Clarification ────────────────────────────────────────────────
@@ -124,8 +140,8 @@ Generate a brief, friendly clarifying question. Be specific about what informati
     const firstUserIdx = cleanHistory.findIndex(m => m.role === 'user');
     const validHistory = firstUserIdx >= 0 ? cleanHistory.slice(firstUserIdx) : [];
 
-    const response = await chatCompletion(prompt, validHistory, query);
-    return { response, responseType: 'clarification', sources: [] };
+    const result = await chatCompletion(prompt, validHistory, query);
+    return { response: result.text, responseType: 'clarification', sources: [] };
   } catch (err) {
     log.error('Clarification generation failed', { traceId, error: err.message });
     return {
@@ -228,38 +244,86 @@ async function fuseResults(state) {
   return { fusedResults, sources };
 }
 
+// ─── Node: Web Search via Gemini Google Search Grounding ────────────────────
+
+async function webSearch(state) {
+  const { query, fusedResults, traceId } = state;
+  log.info('Performing web search for external knowledge', { traceId });
+
+  // Build a focused search query using document context + user question
+  const docSnippets = fusedResults
+    .slice(0, 3)
+    .map(r => r.text.slice(0, 300))
+    .join('\n');
+
+  const searchPrompt = `You are a research assistant. The user has a document and is asking a question that requires external knowledge to answer properly.
+
+Document excerpts:
+${docSnippets}
+
+User question: "${query}"
+
+Based on the document content and the user's question, provide a thorough, factual research summary. Include:
+- What specific items/terms from the document mean (e.g., medicine names → conditions, technical terms → definitions)
+- Relevant context that helps interpret the document
+- Any important details the user should know
+
+Be factual and comprehensive. Cite your reasoning.`;
+
+  try {
+    const result = await chatCompletion(searchPrompt, [], query, { googleSearch: true });
+    log.info('Web search complete', {
+      traceId,
+      hasGrounding: !!result.groundingMetadata,
+      contextLength: result.text.length,
+    });
+    return {
+      webSearchContext: result.text,
+      webSearchUsed: true,
+    };
+  } catch (err) {
+    log.warn('Web search failed, continuing without external context', { traceId, error: err.message });
+    return { webSearchContext: '', webSearchUsed: false };
+  }
+}
+
 // ─── Node: Generate Response ────────────────────────────────────────────────
 
 async function generateResponse(state) {
-  const { query, history, fusedResults, traceId } = state;
-  log.info('Generating grounded response', { traceId, contextChunks: fusedResults.length });
+  const { query, history, fusedResults, webSearchContext, webSearchUsed, traceId } = state;
+  log.info('Generating response', { traceId, contextChunks: fusedResults.length, webSearchUsed });
 
   const context = fusedResults
     .map((r, i) => `[Source ${i + 1} — ${r.metadata?.filename}, Chunk ${r.metadata?.chunkIndex}]\n${r.text}`)
     .join('\n\n');
 
-  const systemPrompt = `You are Alex, a precise and helpful AI assistant for document analysis. You answer questions based ONLY on the provided document context.
+  const webSection = webSearchUsed && webSearchContext
+    ? `\n\n--- EXTERNAL KNOWLEDGE (from web search) ---\n${webSearchContext}\n--- END EXTERNAL KNOWLEDGE ---`
+    : '';
 
-RULES:
-1. ONLY use information from the provided sources — never fabricate facts.
-2. Cite sources inline: e.g., "According to [Source 1], …"
-3. If the context is insufficient to fully answer, state that clearly and share what you CAN determine.
-4. Be concise, professional, and well-structured. Use bullet points or numbered lists when appropriate.
-5. For follow-up questions, use conversation history for context continuity.
+  const systemPrompt = `You are Alex, a precise, knowledgeable, and helpful AI assistant for document analysis.
+
+APPROACH:
+1. Use the DOCUMENT CONTEXT as your primary source of truth — cite it with [Source N].
+2. When the document contains items that need interpretation (e.g., medicine names, technical terms, codes, abbreviations), use your knowledge${webSearchUsed ? ' and the provided external research' : ''} to explain what they mean.
+3. You are allowed and encouraged to apply your knowledge to INTERPRET document content — e.g., identifying medical conditions from prescribed medicines, explaining financial terms, decoding technical jargon.
+4. Clearly distinguish between what the document states vs. what you infer from external knowledge.
+5. Be concise, professional, and well-structured. Use bullet points or numbered lists when appropriate.
+6. For follow-up questions, use conversation history for context continuity.
+7. If you genuinely cannot determine an answer, say so honestly.
 
 --- DOCUMENT CONTEXT ---
 ${context}
---- END CONTEXT ---`;
+--- END DOCUMENT CONTEXT ---${webSection}`;
 
-  // Clean history: ensure first message is from user
   const cleanHistory = history.filter(m => m.role === 'user' || m.role === 'assistant');
   const firstUserIdx = cleanHistory.findIndex(m => m.role === 'user');
   const validHistory = firstUserIdx >= 0 ? cleanHistory.slice(firstUserIdx) : [];
 
   try {
-    const response = await chatCompletion(systemPrompt, validHistory, query);
-    log.info('Response generated', { traceId, responseLength: response.length });
-    return { response, responseType: 'answer' };
+    const result = await chatCompletion(systemPrompt, validHistory, query);
+    log.info('Response generated', { traceId, responseLength: result.text.length });
+    return { response: result.text, responseType: webSearchUsed ? 'answer_with_search' : 'answer' };
   } catch (err) {
     log.error('Response generation failed', { traceId, error: err.message });
     return {
@@ -280,6 +344,15 @@ function routeAfterAnalysis(state) {
   return 'retrieve';
 }
 
+function routeAfterFusion(state) {
+  if (state.needsExternalSearch) {
+    log.info('Routing to web search (external knowledge needed)', { traceId: state.traceId });
+    return 'webSearch';
+  }
+  log.info('Routing directly to generate (sufficient context)', { traceId: state.traceId });
+  return 'generateResponse';
+}
+
 // ─── Graph Construction ─────────────────────────────────────────────────────
 
 function buildAgentGraph() {
@@ -288,6 +361,7 @@ function buildAgentGraph() {
     .addNode('askClarification', askClarification)
     .addNode('retrieve', retrieve)
     .addNode('fuseResults', fuseResults)
+    .addNode('webSearch', webSearch)
     .addNode('generateResponse', generateResponse)
     .addEdge(START, 'analyzeQuery')
     .addConditionalEdges('analyzeQuery', routeAfterAnalysis, {
@@ -296,7 +370,11 @@ function buildAgentGraph() {
     })
     .addEdge('askClarification', END)
     .addEdge('retrieve', 'fuseResults')
-    .addEdge('fuseResults', 'generateResponse')
+    .addConditionalEdges('fuseResults', routeAfterFusion, {
+      webSearch: 'webSearch',
+      generateResponse: 'generateResponse',
+    })
+    .addEdge('webSearch', 'generateResponse')
     .addEdge('generateResponse', END);
 
   return graph.compile();

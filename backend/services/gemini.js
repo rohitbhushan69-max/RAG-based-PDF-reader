@@ -52,34 +52,60 @@ export async function embedQuery(text) {
  * @param {string} systemPrompt
  * @param {{ role: string, content: string }[]} history
  * @param {string} userMessage
- * @returns {Promise<string>}
+ * @param {{ googleSearch?: boolean }} options
+ * @returns {Promise<{ text: string, groundingMetadata?: object }>}
  */
-export async function chatCompletion(systemPrompt, history, userMessage) {
+export async function chatCompletion(systemPrompt, history, userMessage, options = {}) {
   const chatHistory = history.map((msg) => ({
     role: msg.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: msg.content }],
   }));
 
+  // Only models that support Google Search grounding (2.0+)
+  const searchModels = ['gemini-2.0-flash', 'gemini-2.5-flash'];
+  const modelsToTry = options.googleSearch ? searchModels : CHAT_MODELS;
+
   let lastError;
 
-  for (const modelName of CHAT_MODELS) {
+  for (const modelName of modelsToTry) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const model = genAI.getGenerativeModel({
+        const modelConfig = {
           model: modelName,
           systemInstruction: systemPrompt,
-        });
+        };
 
+        if (options.googleSearch) {
+          modelConfig.tools = [{ googleSearch: {} }];
+        }
+
+        const model = genAI.getGenerativeModel(modelConfig);
         const chat = model.startChat({ history: chatHistory });
         const result = await chat.sendMessage(userMessage);
-        console.log(`Chat completed with model: ${modelName}`);
-        return result.response.text();
+        console.log(`Chat completed with model: ${modelName}${options.googleSearch ? ' (with Google Search)' : ''}`);
+
+        const response = { text: result.response.text() };
+
+        // Extract grounding metadata if available
+        if (options.googleSearch) {
+          const candidate = result.response.candidates?.[0];
+          if (candidate?.groundingMetadata) {
+            response.groundingMetadata = candidate.groundingMetadata;
+          }
+        }
+
+        return response;
       } catch (err) {
         lastError = err;
         if (err.status === 429) {
           console.warn(`Rate limited on ${modelName} (attempt ${attempt + 1}), trying next option...`);
           await sleep(1000);
           break; // try next model
+        }
+        // If google search tool not supported on this model, try next
+        if (options.googleSearch && err.message?.includes('tool')) {
+          console.warn(`Google Search not supported on ${modelName}, trying next...`);
+          break;
         }
         throw err; // non-rate-limit errors should propagate
       }
