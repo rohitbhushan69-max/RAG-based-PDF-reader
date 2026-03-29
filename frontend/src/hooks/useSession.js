@@ -77,7 +77,12 @@ export function useSession() {
 
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: data.reply, sources: data.sources },
+          {
+            role: 'assistant',
+            content: data.reply,
+            sources: data.sources,
+            type: data.type, // 'answer' | 'clarification'
+          },
         ]);
       } catch (err) {
         const msg = err.response?.data?.error || 'Failed to get response';

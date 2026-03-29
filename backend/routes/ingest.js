@@ -4,6 +4,10 @@ import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 import { chunkText } from '../utils/chunker.js';
 import { generateEmbeddings } from '../services/gemini.js';
 import { addDocuments } from '../services/vectorStore.js';
+import { addToIndex } from '../services/keywordStore.js';
+import { createLogger } from '../utils/logger.js';
+
+const log = createLogger('ingest');
 
 const router = Router();
 const upload = multer({
@@ -48,8 +52,16 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     // Generate embeddings
     const embeddings = await generateEmbeddings(chunks.map((c) => c.text));
 
-    // Store in vector store
+    // Store in vector store + keyword index
     addDocuments(sessionId, chunks, embeddings);
+    addToIndex(sessionId, chunks);
+
+    log.info('PDF ingested', {
+      sessionId: sessionId.slice(0, 8),
+      filename: req.file.originalname,
+      pages: pdfData.numpages,
+      chunkCount: chunks.length,
+    });
 
     res.json({
       sessionId,
@@ -58,7 +70,7 @@ router.post('/', upload.single('pdf'), async (req, res) => {
       chunkCount: chunks.length,
     });
   } catch (err) {
-    console.error('Ingest error:', err);
+    log.error('Ingest error', { error: err.message });
     res.status(500).json({ error: err.message || 'Failed to process PDF' });
   }
 });

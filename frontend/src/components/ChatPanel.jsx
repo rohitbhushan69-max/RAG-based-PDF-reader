@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Bot, SendHorizonal, ChevronDown, ChevronUp, FileText } from 'lucide-react';
+import { Bot, SendHorizonal, ChevronDown, ChevronUp, FileText, HelpCircle, Search, Type } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
 function TypingIndicator() {
@@ -53,11 +53,24 @@ function Sources({ sources }) {
               border: '1px solid #f1f5f9',
             }}>
               <FileText style={{ width: 14, height: 14, marginTop: 1, flexShrink: 0, color: '#94a3b8' }} />
-              <div>
-                <span style={{ fontWeight: 600, color: '#475569' }}>
-                  {s.filename} · Chunk {s.chunkIndex}
-                </span>
-                <span style={{ color: '#c7d2fe', marginLeft: 8 }}>({Math.round(s.score * 100)}%)</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <span style={{ fontWeight: 600, color: '#475569' }}>
+                    {s.filename} · Chunk {s.chunkIndex}
+                  </span>
+                  {s.matchType && (
+                    <span style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 3,
+                      padding: '1px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600,
+                      background: s.matchType === 'both' ? '#ecfdf5' : s.matchType === 'semantic' ? '#eef2ff' : '#fef3c7',
+                      color: s.matchType === 'both' ? '#059669' : s.matchType === 'semantic' ? '#4f46e5' : '#d97706',
+                    }}>
+                      {s.matchType === 'semantic' && <><Search style={{ width: 9, height: 9 }} /> Semantic</>}
+                      {s.matchType === 'keyword' && <><Type style={{ width: 9, height: 9 }} /> Keyword</>}
+                      {s.matchType === 'both' && <><Search style={{ width: 9, height: 9 }} /> Both</>}
+                    </span>
+                  )}
+                </div>
                 <p style={{ margin: '4px 0 0', color: '#94a3b8', lineHeight: 1.5 }}>{s.text}</p>
               </div>
             </div>
@@ -73,6 +86,17 @@ function MessageBubble({ message }) {
 
   return (
     <div className="animate-fade-in">
+      {/* Clarification indicator */}
+      {!isUser && message.type === 'clarification' && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 6,
+          marginLeft: 44, marginBottom: 4,
+          fontSize: 11, color: '#f59e0b', fontWeight: 500,
+        }}>
+          <HelpCircle style={{ width: 12, height: 12 }} />
+          Clarifying question
+        </div>
+      )}
       <div style={{
         display: 'flex', alignItems: 'flex-start', gap: 12,
         flexDirection: isUser ? 'row-reverse' : 'row',
