@@ -51,6 +51,9 @@ const AgentState = Annotation.Root({
   webSearchContext:   Annotation({ reducer: (_, v) => v ?? _, default: () => '' }),
   webSearchUsed:      Annotation({ reducer: (_, v) => v !== undefined ? v : _, default: () => false }),
 
+  // Agent decision log — accumulates steps as the graph executes
+  agentTrace:         Annotation({ reducer: (prev, v) => [...(prev || []), ...(v || [])], default: () => [] }),
+
   // Output
   response:           Annotation({ reducer: (_, v) => v ?? _, default: () => '' }),
   sources:            Annotation({ reducer: (_, v) => v ?? _, default: () => [] }),
@@ -113,13 +116,14 @@ needsExternalSearch=false when:
         needsClarification: analysis.needsClarification === true,
         needsExternalSearch: analysis.needsExternalSearch === true,
         clarifyReason: analysis.clarifyReason || '',
+        agentTrace: [{ node: 'analyzeQuery', ts: Date.now(), intent: analysis.intent, needsClarification: analysis.needsClarification, needsExternalSearch: analysis.needsExternalSearch }],
       };
     }
   } catch (err) {
     log.warn('Query analysis failed, defaulting to retrieval', { traceId, error: err.message });
   }
 
-  return { intent: 'question', needsClarification: false, needsExternalSearch: false, clarifyReason: '' };
+  return { intent: 'question', needsClarification: false, needsExternalSearch: false, clarifyReason: '', agentTrace: [{ node: 'analyzeQuery', ts: Date.now(), intent: 'question', fallback: true }] };
 }
 
 // ─── Node: Ask Clarification ────────────────────────────────────────────────
@@ -141,13 +145,14 @@ Generate a brief, friendly clarifying question. Be specific about what informati
     const validHistory = firstUserIdx >= 0 ? cleanHistory.slice(firstUserIdx) : [];
 
     const result = await chatCompletion(prompt, validHistory, query);
-    return { response: result.text, responseType: 'clarification', sources: [] };
+    return { response: result.text, responseType: 'clarification', sources: [], agentTrace: [{ node: 'askClarification', ts: Date.now(), reason: clarifyReason }] };
   } catch (err) {
     log.error('Clarification generation failed', { traceId, error: err.message });
     return {
       response: "Could you be more specific? That'll help me search the documents more effectively.",
       responseType: 'clarification',
       sources: [],
+      agentTrace: [{ node: 'askClarification', ts: Date.now(), fallback: true }],
     };
   }
 }
@@ -184,7 +189,11 @@ async function retrieve(state) {
     })(),
   ]);
 
-  return { vectorResults, keywordResults };
+  return {
+    vectorResults,
+    keywordResults,
+    agentTrace: [{ node: 'retrieve', ts: Date.now(), vectorCount: vectorResults.length, keywordCount: keywordResults.length }],
+  };
 }
 
 // ─── Node: Reciprocal Rank Fusion ───────────────────────────────────────────
@@ -234,6 +243,7 @@ async function fuseResults(state) {
     text: r.text.slice(0, 200) + (r.text.length > 200 ? '…' : ''),
     filename: r.metadata?.filename,
     chunkIndex: r.metadata?.chunkIndex,
+    page: r.metadata?.page || null,
     score: Math.round(r.fusedScore * 10000) / 10000,
     vectorRank: r.vectorRank,
     keywordRank: r.keywordRank,
@@ -241,7 +251,7 @@ async function fuseResults(state) {
   }));
 
   log.info('Fusion complete', { traceId, fusedCount: fusedResults.length });
-  return { fusedResults, sources };
+  return { fusedResults, sources, agentTrace: [{ node: 'fuseResults', ts: Date.now(), fusedCount: fusedResults.length, bothCount: sources.filter(s => s.matchType === 'both').length }] };
 }
 
 // ─── Node: Web Search via Gemini Google Search Grounding ────────────────────
@@ -280,10 +290,11 @@ Be factual and comprehensive. Cite your reasoning.`;
     return {
       webSearchContext: result.text,
       webSearchUsed: true,
+      agentTrace: [{ node: 'webSearch', ts: Date.now(), success: true, hasGrounding: !!result.groundingMetadata }],
     };
   } catch (err) {
     log.warn('Web search failed, continuing without external context', { traceId, error: err.message });
-    return { webSearchContext: '', webSearchUsed: false };
+    return { webSearchContext: '', webSearchUsed: false, agentTrace: [{ node: 'webSearch', ts: Date.now(), success: false }] };
   }
 }
 
@@ -294,12 +305,29 @@ async function generateResponse(state) {
   log.info('Generating response', { traceId, contextChunks: fusedResults.length, webSearchUsed });
 
   const context = fusedResults
-    .map((r, i) => `[Source ${i + 1} — ${r.metadata?.filename}, Chunk ${r.metadata?.chunkIndex}]\n${r.text}`)
+    .map((r, i) => `[Source ${i + 1} — ${r.metadata?.filename}, Chunk ${r.metadata?.chunkIndex}${r.metadata?.page ? `, Page ${r.metadata.page}` : ''}]\n${r.text}`)
     .join('\n\n');
 
   const webSection = webSearchUsed && webSearchContext
     ? `\n\n--- EXTERNAL KNOWLEDGE (from web search) ---\n${webSearchContext}\n--- END EXTERNAL KNOWLEDGE ---`
     : '';
+
+  // Detect medical content for domain-specific instructions
+  const allText = fusedResults.map(r => r.text).join(' ').toLowerCase();
+  const medicalSignals = ['prescription', 'dosage', 'mg', 'tablet', 'capsule', 'diagnosis',
+    'patient', 'dr.', 'doctor', 'rx', 'medication', 'pharmaceutical', 'clinical',
+    'symptom', 'treatment', 'medicine', 'hospital', 'medical', 'healthcare'];
+  const medicalHits = medicalSignals.filter(s => allText.includes(s)).length;
+  const isMedical = medicalHits >= 2;
+
+  const medicalInstructions = isMedical ? `
+MEDICAL DOMAIN GUIDELINES:
+- When you identify medicines/drugs, explain what condition they typically treat, their drug class, and common usage.
+- Flag any potential drug interactions if multiple medications are mentioned.
+- If dosages are listed, note whether they appear to be standard adult dosages.
+- Always include a disclaimer: "This is AI-generated analysis for informational purposes only. Consult a healthcare professional for medical advice."
+- Use precise medical terminology but also provide plain-language explanations.
+` : '';
 
   const systemPrompt = `You are Alex, a precise, knowledgeable, and helpful AI assistant for document analysis.
 
@@ -311,7 +339,7 @@ APPROACH:
 5. Be concise, professional, and well-structured. Use bullet points or numbered lists when appropriate.
 6. For follow-up questions, use conversation history for context continuity.
 7. If you genuinely cannot determine an answer, say so honestly.
-
+${medicalInstructions}
 --- DOCUMENT CONTEXT ---
 ${context}
 --- END DOCUMENT CONTEXT ---${webSection}`;
@@ -323,12 +351,13 @@ ${context}
   try {
     const result = await chatCompletion(systemPrompt, validHistory, query);
     log.info('Response generated', { traceId, responseLength: result.text.length });
-    return { response: result.text, responseType: webSearchUsed ? 'answer_with_search' : 'answer' };
+    return { response: result.text, responseType: webSearchUsed ? 'answer_with_search' : 'answer', agentTrace: [{ node: 'generateResponse', ts: Date.now(), webSearchUsed, contextChunks: fusedResults.length, medicalMode: isMedical }] };
   } catch (err) {
     log.error('Response generation failed', { traceId, error: err.message });
     return {
       response: "I encountered an error generating a response. Please try again.",
       responseType: 'answer',
+      agentTrace: [{ node: 'generateResponse', ts: Date.now(), error: true }],
     };
   }
 }

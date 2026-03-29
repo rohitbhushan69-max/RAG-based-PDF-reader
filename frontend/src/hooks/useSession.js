@@ -81,7 +81,8 @@ export function useSession() {
             role: 'assistant',
             content: data.reply,
             sources: data.sources,
-            type: data.type, // 'answer' | 'clarification'
+            type: data.type, // 'answer' | 'clarification' | 'answer_with_search'
+            agentTrace: data.agentTrace || [],
           },
         ]);
       } catch (err) {

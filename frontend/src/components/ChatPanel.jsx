@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Bot, SendHorizonal, ChevronDown, ChevronUp, FileText, HelpCircle, Search, Type, Globe } from 'lucide-react';
+import { Bot, SendHorizonal, ChevronDown, ChevronUp, FileText, HelpCircle, Search, Type, Globe, Activity } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 
 function TypingIndicator() {
@@ -57,6 +57,7 @@ function Sources({ sources }) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                   <span style={{ fontWeight: 600, color: '#475569' }}>
                     {s.filename} · Chunk {s.chunkIndex}
+                    {s.page && <span style={{ color: '#94a3b8', fontWeight: 500 }}> · p.{s.page}</span>}
                   </span>
                   {s.matchType && (
                     <span style={{
@@ -75,6 +76,95 @@ function Sources({ sources }) {
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const NODE_META = {
+  analyzeQuery:     { label: 'Query Analysis',   color: '#6366f1', bg: '#eef2ff' },
+  askClarification: { label: 'Clarification',    color: '#f59e0b', bg: '#fef3c7' },
+  retrieve:         { label: 'Retrieval',         color: '#0ea5e9', bg: '#e0f2fe' },
+  fuseResults:      { label: 'RRF Fusion',        color: '#8b5cf6', bg: '#ede9fe' },
+  webSearch:        { label: 'Web Search',         color: '#059669', bg: '#ecfdf5' },
+  generateResponse: { label: 'Response',           color: '#ec4899', bg: '#fce7f3' },
+};
+
+function AgentTrace({ trace }) {
+  const [open, setOpen] = useState(false);
+  if (!trace || trace.length === 0) return null;
+
+  return (
+    <div style={{ marginLeft: 44, marginTop: 6 }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 4,
+          fontSize: 12, color: '#8b5cf6', background: 'none',
+          border: 'none', cursor: 'pointer', padding: '2px 0',
+          fontWeight: 500,
+        }}
+      >
+        <Activity style={{ width: 12, height: 12 }} />
+        {open ? <ChevronUp style={{ width: 12, height: 12 }} /> : <ChevronDown style={{ width: 12, height: 12 }} />}
+        Agent Trace ({trace.length} steps)
+      </button>
+      {open && (
+        <div style={{ marginTop: 8, position: 'relative', paddingLeft: 16 }}>
+          {/* Vertical line */}
+          <div style={{
+            position: 'absolute', left: 6, top: 4, bottom: 4,
+            width: 2, background: '#e2e8f0', borderRadius: 1,
+          }} />
+          {trace.map((step, i) => {
+            const meta = NODE_META[step.node] || { label: step.node, color: '#64748b', bg: '#f1f5f9' };
+            const details = [];
+            if (step.intent) details.push(`Intent: ${step.intent}`);
+            if (step.needsClarification) details.push('Needs clarification');
+            if (step.needsExternalSearch) details.push('Needs web search');
+            if (step.reason) details.push(`Reason: ${step.reason}`);
+            if (step.vectorCount != null) details.push(`${step.vectorCount} vector`);
+            if (step.keywordCount != null) details.push(`${step.keywordCount} keyword`);
+            if (step.fusedCount != null) details.push(`${step.fusedCount} fused results`);
+            if (step.bothCount != null) details.push(`${step.bothCount} matched both`);
+            if (step.hasGrounding != null) details.push(step.hasGrounding ? 'Grounded' : 'No grounding');
+            if (step.webSearchUsed != null) details.push(step.webSearchUsed ? 'Web-enhanced' : 'Document only');
+            if (step.contextChunks != null) details.push(`${step.contextChunks} context chunks`);
+            if (step.medicalMode) details.push('🏥 Medical mode');
+            if (step.fallback) details.push('Fallback');
+            if (step.error) details.push('Error occurred');
+
+            return (
+              <div key={i} style={{
+                display: 'flex', alignItems: 'flex-start', gap: 10,
+                marginBottom: i < trace.length - 1 ? 8 : 0,
+                position: 'relative',
+              }}>
+                {/* Dot */}
+                <div style={{
+                  width: 10, height: 10, borderRadius: '50%',
+                  background: meta.color, border: '2px solid white',
+                  boxShadow: '0 0 0 1px ' + meta.color,
+                  flexShrink: 0, marginTop: 3, marginLeft: -4,
+                  position: 'relative', zIndex: 1,
+                }} />
+                <div style={{ flex: 1 }}>
+                  <span style={{
+                    display: 'inline-block', padding: '1px 8px', borderRadius: 4,
+                    fontSize: 11, fontWeight: 600, color: meta.color, background: meta.bg,
+                  }}>
+                    {meta.label}
+                  </span>
+                  {details.length > 0 && (
+                    <span style={{ fontSize: 11, color: '#94a3b8', marginLeft: 8 }}>
+                      {details.join(' · ')}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -164,6 +254,8 @@ function MessageBubble({ message }) {
 
       {/* Sources */}
       {!isUser && message.sources && <Sources sources={message.sources} />}
+      {/* Agent Trace */}
+      {!isUser && message.agentTrace && <AgentTrace trace={message.agentTrace} />}
     </div>
   );
 }

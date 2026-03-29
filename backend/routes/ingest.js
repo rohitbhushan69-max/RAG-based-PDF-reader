@@ -39,12 +39,13 @@ router.post('/', upload.single('pdf'), async (req, res) => {
     }
 
     // Chunk the text
-    const rawChunks = chunkText(text);
+    const rawChunks = chunkText(text, { totalPages: pdfData.numpages });
     const chunks = rawChunks.map((c) => ({
       ...c,
       metadata: {
         filename: req.file.originalname,
         chunkIndex: c.id,
+        page: c.page,
         sessionId,
       },
     }));

@@ -56,7 +56,8 @@ router.post('/', async (req, res) => {
     res.json({
       reply: result.response,
       sources: result.sources || [],
-      type: result.responseType, // 'answer' | 'clarification'
+      type: result.responseType,
+      agentTrace: result.agentTrace || [],
     });
   } catch (err) {
     log.error('Chat error', { traceId, error: err.message });
